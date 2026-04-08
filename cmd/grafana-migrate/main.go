@@ -95,7 +95,19 @@ func main() {
 	}
 	log.Infoln("✅ migration_log statements removed")
 	// Fix char conversion (char -> chr)
-	if err := sqlite.CustomSanitize(dumpPath, `char\(10\)\)`, []byte("chr(10))")); err != nil {
+	if err := sqlite.CustomSanitize(dumpPath, `\bchar\s*\(`, []byte("chr(")); err != nil {
+		log.Fatalf("❌ %v - failed to perform char keyword sanitizing of the dump file.", err)
+	}
+	log.Infoln("✅ char keyword transformed")
+
+	// Drop _litestream_seq
+	if err := sqlite.CustomSanitize(dumpPath, `(?m)^(INSERT INTO "_litestream_seq".*\n?)`, []byte("")); err != nil {
+		log.Fatalf("❌ %v - failed to drop _litestream_seq rows.", err)
+	}
+	log.Infoln("✅ _litestream_seq rows dropped")
+
+	// Fix is_paused conversion (int -> bool)
+	if err := sqlite.normalizeIsPaused(dumpPath); err != nil {
 		log.Fatalf("❌ %v - failed to perform char keyword sanitizing of the dump file.", err)
 	}
 	log.Infoln("✅ char keyword transformed")

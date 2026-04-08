@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"regexp"
+	"strings"
 )
 
 // Sanitize cleans up a SQLite dump file to prep it for import into Postgres.
@@ -44,7 +45,6 @@ func CustomSanitize(dumpFile string, regex string, replacement []byte) error {
 
 }
 
-
 // RemoveCreateStatements takes all the CREATE statements out of a dump
 // so that no new tables are created.
 func RemoveCreateStatements(dumpFile string) error {
@@ -73,5 +73,32 @@ func HexDecode(dumpFile string) error {
 
 	// Replace regex matches from the dumpFile using the `decodeHex` function defined above.
 	sanitized := re.ReplaceAllFunc(data, decodeHex)
+	return ioutil.WriteFile(dumpFile, sanitized, 0644)
+}
+
+// AddColumnNames adds explicit column names to INSERT statements in the dump file
+// so that values are mapped correctly regardless of column order in the target database.
+func AddColumnNames(dumpFile string, columns map[string][]string) error {
+	data, err := ioutil.ReadFile(dumpFile)
+	if err != nil {
+		return err
+	}
+
+	re := regexp.MustCompile(`(?m)^(INSERT INTO "([^"]+)") (VALUES.*)$`)
+	sanitized := re.ReplaceAllFunc(data, func(match []byte) []byte {
+		submatches := re.FindSubmatch(match)
+		tableName := string(submatches[2])
+		cols, ok := columns[tableName]
+		if !ok {
+			return match
+		}
+		quotedCols := make([]string, len(cols))
+		for i, col := range cols {
+			quotedCols[i] = fmt.Sprintf(`"%s"`, col)
+		}
+		colList := strings.Join(quotedCols, ", ")
+		return []byte(fmt.Sprintf("%s (%s) %s", string(submatches[1]), colList, string(submatches[3])))
+	})
+
 	return ioutil.WriteFile(dumpFile, sanitized, 0644)
 }

@@ -106,17 +106,22 @@ func main() {
 	}
 	log.Infoln("✅ _litestream_seq rows dropped")
 
-	// Fix is_paused conversion (int -> bool)
-	if err := sqlite.normalizeIsPaused(dumpPath); err != nil {
-		log.Fatalf("❌ %v - failed to perform char keyword sanitizing of the dump file.", err)
-	}
-	log.Infoln("✅ char keyword transformed")
-
 	// Do HexDecoding
 	if err := sqlite.HexDecode(dumpPath); err != nil {
 		log.Fatalf("❌ %v - failed to wrap hex-encoded values in the dump file.", err)
 	}
 	log.Infoln("✅ hex-encoded data values wrapped for insertion")
+
+	// Get column names from SQLite and add them to INSERT statements
+	// so values are mapped to the correct columns in Postgres
+	columnMap, err := sqlite.GetTableColumns(f.Name())
+	if err != nil {
+		log.Fatalf("❌ %v - failed to get column names from SQLite database.", err)
+	}
+	if err := sqlite.AddColumnNames(dumpPath, columnMap); err != nil {
+		log.Fatalf("❌ %v - failed to add column names to INSERT statements.", err)
+	}
+	log.Infoln("✅ column names added to INSERT statements")
 
 	// Connect to Postgres
 	db, err := postgresql.New(*connstring, log)

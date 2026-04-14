@@ -63,25 +63,57 @@ func (db *DB) ImportDump(dumpFile string) error {
 
 	sqlStmts := strings.Split(string(file), ";\n")
 
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	// Defer all constraint checks to the end of the transaction
+	if _, err := tx.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		db.log.Debugf("Could not defer constraints (this is okay if none are deferrable): %v", err)
+	}
+
 	for _, stmt := range sqlStmts {
-		if _, err := db.conn.Exec(stmt); err != nil {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := tx.Exec(stmt); err != nil {
 			// We can safely ignore "duplicate key value violates unique constraint" errors.
 			if strings.Contains(err.Error(), "duplicate key") {
 				db.log.Warnf("duplicate key: %s", err)
+				// Rollback and start a new transaction since the current one is aborted
+				tx.Rollback()
+				tx, err = db.conn.Begin()
+				if err != nil {
+					return fmt.Errorf("failed to begin transaction: %v", err)
+				}
 				continue
 			} else if strings.Contains(err.Error(), "is of type bytes but expression is of type text") {
 				// TODO(wbh1): This is absolutely horrible and I am ashamed of this code. Should figure out column types ahead of time.
 				db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", err.Error())
+				// Rollback and start a new transaction since the current one is aborted
+				tx.Rollback()
+				tx, err = db.conn.Begin()
+				if err != nil {
+					return fmt.Errorf("failed to begin transaction: %v", err)
+				}
 				stmt = strings.Replace(
 					strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
 					"'utf-8'", "'hex'", 1)
-				if _, err := db.conn.Exec(stmt); err != nil {
+				if _, err := tx.Exec(stmt); err != nil {
+					tx.Rollback()
 					return fmt.Errorf("%v %v", err.Error(), stmt)
 				}
 			} else {
+				tx.Rollback()
 				return fmt.Errorf("%v %v", err.Error(), stmt)
 			}
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
 	// Fix boolean columns that we converted before.

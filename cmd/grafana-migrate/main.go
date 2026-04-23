@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime/pprof"
 
 	"github.com/percona/grafana-db-migrator/pkg/postgresql"
 	"github.com/percona/grafana-db-migrator/pkg/sqlite"
@@ -21,6 +22,7 @@ var (
 	changeCharToText   = app.Flag("change-char-to-text", "Change CHAR filed to TEXT").Bool()
 	// fix relationshop between dashboard and folders (provisioning error)
 	fixFoldersID = app.Flag("fix-folders-id", "Fix correlation between folders and dashboards").Bool()
+	pprofFile    = app.Flag("pprof", "Write CPU profile to the given file path").String()
 )
 
 func main() {
@@ -35,11 +37,24 @@ func main() {
 		log.SetLevel(logrus.DebugLevel)
 	}
 
+	if *pprofFile != "" {
+		f, err := os.Create(*pprofFile)
+		if err != nil {
+			log.Fatalf("❌ could not create CPU profile: %v", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatalf("❌ could not start CPU profile: %v", err)
+		}
+		defer pprof.StopCPUProfile()
+		log.Infof("CPU profiling enabled, writing to %s", *pprofFile)
+	}
+
 	dumpPath := *dump + "/grafana.sql"
 
 	// Must dereference
-	f := *sqlitefile
-	log.Infof("📁 SQLlite file: %v", f.Name())
+	sqliteF := *sqlitefile
+	log.Infof("📁 SQLlite file: %v", sqliteF.Name())
 	log.Infof("📁 Dump directory: %v", *dump)
 
 	// Make sure SQLite exists on machine
@@ -54,7 +69,7 @@ func main() {
 			log.Fatalf("❌ %v - failed to connect to Postgres database.", err)
 		}
 		// Get folder/dashboard relationshio for fixing after upgrade
-		sqliteDashboardTree, sqliteFolders, err := sqlite.GetFolders(f.Name())
+		sqliteDashboardTree, sqliteFolders, err := sqlite.GetFolders(sqliteF.Name())
 		if err != nil {
 			log.Fatalf("❌ %v - failed to get relationship between folders and dashboards.", err)
 		}
@@ -72,7 +87,7 @@ func main() {
 	}
 
 	// Dump the SQLite database
-	if err := sqlite.Dump(f.Name(), dumpPath); err != nil {
+	if err := sqlite.Dump(sqliteF.Name(), dumpPath); err != nil {
 		log.Fatalf("❌ %v - failed to dump database.", err)
 	}
 	log.Infof("✅ sqlite3 database dumped to %v", dumpPath)
@@ -114,7 +129,7 @@ func main() {
 
 	// Get column names from SQLite and add them to INSERT statements
 	// so values are mapped to the correct columns in Postgres
-	columnMap, err := sqlite.GetTableColumns(f.Name())
+	columnMap, err := sqlite.GetTableColumns(sqliteF.Name())
 	if err != nil {
 		log.Fatalf("❌ %v - failed to get column names from SQLite database.", err)
 	}
@@ -149,7 +164,7 @@ func main() {
 
 	if *changeCharToText {
 		if err := db.ChangeCharToText(); err != nil {
-			log.Fatalf("❌ %v - failed convert CHAR type to TEXT")
+			log.Fatalf("❌ %v - failed convert CHAR type to TEXT", err)
 		}
 		log.Infoln("✅ CHAR type was converted to TEXT.")
 	}

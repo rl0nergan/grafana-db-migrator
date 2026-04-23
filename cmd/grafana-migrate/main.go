@@ -106,51 +106,19 @@ func main() {
 	}
 	log.Infof("✅ sqlite3 database dumped to %v", dumpPath)
 
-	// Remove CREATE statements
-	if err := sqlite.RemoveCreateStatements(dumpPath); err != nil {
-		log.Fatalf("❌ %v - failed to remove CREATE statements from dump file.", err)
-	}
-	log.Infoln("✅ CREATE statements removed from dump file")
-
-	// Sanitize the SQLite dump
-	if err := sqlite.Sanitize(dumpPath); err != nil {
-		log.Fatalf("❌ %v - failed to sanitize dump file.", err)
-	}
-	log.Infoln("✅ sqlite3 dump sanitized")
-
-	// Don't bother adding anything to the migration_log table.
-	if err := sqlite.CustomSanitize(dumpPath, `(?msU)[\r\n]+^.*"migration_log.*;$`, nil); err != nil {
-		log.Fatalf("❌ %v - failed to perform additional sanitizing of the dump file.", err)
-	}
-	log.Infoln("✅ migration_log statements removed")
-	// Fix char conversion (char -> chr)
-	if err := sqlite.CustomSanitize(dumpPath, `\bchar\s*\(`, []byte("chr(")); err != nil {
-		log.Fatalf("❌ %v - failed to perform char keyword sanitizing of the dump file.", err)
-	}
-	log.Infoln("✅ char keyword transformed")
-
-	// Drop _litestream_seq
-	if err := sqlite.CustomSanitize(dumpPath, `(?m)^(INSERT INTO "_litestream_seq".*\n?)`, []byte("")); err != nil {
-		log.Fatalf("❌ %v - failed to drop _litestream_seq rows.", err)
-	}
-	log.Infoln("✅ _litestream_seq rows dropped")
-
-	// Do HexDecoding
-	if err := sqlite.HexDecode(dumpPath); err != nil {
-		log.Fatalf("❌ %v - failed to wrap hex-encoded values in the dump file.", err)
-	}
-	log.Infoln("✅ hex-encoded data values wrapped for insertion")
-
-	// Get column names from SQLite and add them to INSERT statements
-	// so values are mapped to the correct columns in Postgres
+	// Get column names from SQLite before sanitization so the pipeline can
+	// inject them inline (reads the SQLite file directly, not the dump).
 	columnMap, err := sqlite.GetTableColumns(sqliteF.Name())
 	if err != nil {
 		log.Fatalf("❌ %v - failed to get column names from SQLite database.", err)
 	}
-	if err := sqlite.AddColumnNames(dumpPath, columnMap); err != nil {
-		log.Fatalf("❌ %v - failed to add column names to INSERT statements.", err)
+
+	// Single-pass sanitization: replaces the previous 8-step read-write cycle.
+	sanitizedPath := dumpPath + ".sanitized"
+	if err := sqlite.SanitizePipeline(dumpPath, sanitizedPath, columnMap); err != nil {
+		log.Fatalf("❌ %v - failed to sanitize dump file.", err)
 	}
-	log.Infoln("✅ column names added to INSERT statements")
+	log.Infoln("✅ sqlite3 dump sanitized")
 
 	// Connect to Postgres
 	db, err := postgresql.New(*connstring, log)
@@ -159,7 +127,7 @@ func main() {
 	}
 
 	// Import the now-sanitized dump file into Postgres
-	if err := db.ImportDump(dumpPath, *batchSize); err != nil {
+	if err := db.ImportDump(sanitizedPath, *batchSize); err != nil {
 		log.Fatalf("❌ %v - failed to import dump file to Postgres.", err)
 	}
 	log.Infoln("✅ Imported dump file to Postgres")

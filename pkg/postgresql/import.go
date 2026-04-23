@@ -2,11 +2,13 @@ package postgresql
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
+	"sync"
 
 	// Postgres driver
 	_ "github.com/lib/pq"
@@ -58,39 +60,36 @@ func (db *DB) ImportDump(dumpFile string, batchSize int) error {
 		}
 	}
 
-	file, err := ioutil.ReadFile(dumpFile)
+	f, err := os.Open(dumpFile)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	sqlStmts := strings.Split(string(file), ";\n")
+	// Acquire a dedicated connection so session settings persist across all
+	// batch transactions without re-issuing them per batch.
+	ctx := context.Background()
+	conn, err := db.conn.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection: %v", err)
+	}
+	defer func() {
+		conn.ExecContext(ctx, "SET session_replication_role = 'origin'")
+		conn.Close()
+	}()
 
-	// Filter out empty statements
-	stmts := make([]string, 0, len(sqlStmts))
-	for _, stmt := range sqlStmts {
-		stmt = strings.TrimSpace(stmt)
-		if stmt != "" {
-			stmts = append(stmts, stmt)
-		}
+	// Set once for the entire import; persists across transactions on this connection.
+	if _, err := conn.ExecContext(ctx, "SET session_replication_role = 'replica'"); err != nil {
+		db.log.Debugf("Could not set session_replication_role (ok if not superuser): %v", err)
 	}
 
-	if batchSize <= 0 {
-		batchSize = len(stmts)
-	}
-
-	for i := 0; i < len(stmts); i += batchSize {
-		end := i + batchSize
-		if end > len(stmts) {
-			end = len(stmts)
-		}
-		batch := stmts[i:end]
-
-		batchNum := (i / batchSize) + 1
+	batchNum := 0
+	if err := streamStatements(f, batchSize, func(batch []string) error {
+		batchNum++
 		db.log.Infof("Importing batch %d (%d statements)", batchNum, len(batch))
-
-		if err := db.importBatch(batch); err != nil {
-			return fmt.Errorf("batch %d failed: %v", batchNum, err)
-		}
+		return db.importBatchOnConn(ctx, conn, batch)
+	}); err != nil {
+		return fmt.Errorf("batch %d failed: %v", batchNum, err)
 	}
 
 	// Fix boolean columns that we converted before.
@@ -106,46 +105,136 @@ func (db *DB) ImportDump(dumpFile string, batchSize int) error {
 	}
 
 	return nil
-
 }
 
-// importBatch executes a slice of SQL statements inside a single transaction.
-func (db *DB) importBatch(stmts []string) error {
-	tx, err := db.conn.Begin()
+// advanceQuoteState processes s tracking single-quoted SQL string state
+// ('' is an escaped quote inside a string). Returns whether the line ends a
+// SQL statement and the updated in-string state.
+func advanceQuoteState(s string, inString bool) (endsStatement bool, newInString bool) {
+	for i := 0; i < len(s); i++ {
+		if inString {
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // skip escaped ''
+				} else {
+					inString = false
+				}
+			}
+		} else {
+			if s[i] == '\'' {
+				inString = true
+			}
+		}
+	}
+	return !inString && len(s) > 0 && s[len(s)-1] == ';', inString
+}
+
+// streamStatements reads SQL statements from r and invokes fn for each
+// complete batch. Statements may span multiple lines (e.g. when string values
+// contain embedded newlines); quote-aware parsing detects statement boundaries.
+// COMMIT statements from the sqlite3 dump are discarded — each batch manages
+// its own transaction.
+func streamStatements(r io.Reader, batchSize int, fn func([]string) error) error {
+	br := bufio.NewReaderSize(r, 1<<20) // 1 MB read buffer
+	var batch []string
+	var stmtLines []string
+	inString := false
+
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			s := strings.TrimRight(string(line), "\r\n")
+
+			if s == "" {
+				goto checkErr
+			}
+
+			// Skip bare COMMIT lines — batches handle their own commits.
+			if s == "COMMIT" || s == "COMMIT;" {
+				goto checkErr
+			}
+
+			{
+				endsStmt, newInString := advanceQuoteState(s, inString)
+				inString = newInString
+				stmtLines = append(stmtLines, s)
+
+				if endsStmt {
+					var stmt string
+					if len(stmtLines) == 1 {
+						stmt = stmtLines[0]
+					} else {
+						stmt = strings.Join(stmtLines, "\n")
+					}
+					stmt = strings.TrimSpace(stmt)
+					if strings.HasSuffix(stmt, ";") {
+						stmt = stmt[:len(stmt)-1]
+					}
+					if stmt != "" {
+						batch = append(batch, stmt)
+						if batchSize > 0 && len(batch) >= batchSize {
+							if err2 := fn(batch); err2 != nil {
+								return err2
+							}
+							batch = batch[:0] // reset, reuse backing array
+						}
+					}
+					stmtLines = stmtLines[:0]
+				}
+			}
+		}
+
+	checkErr:
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(batch) > 0 {
+		return fn(batch)
+	}
+	return nil
+}
+
+// importBatchOnConn executes a slice of SQL statements inside a single
+// transaction on the provided dedicated connection.
+func (db *DB) importBatchOnConn(ctx context.Context, conn *sql.Conn, stmts []string) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
 
-	// Defer all constraint checks to the end of the transaction
-	if _, err := tx.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+	// Defer all constraint checks to the end of this transaction.
+	if _, err := tx.ExecContext(ctx, "SET CONSTRAINTS ALL DEFERRED"); err != nil {
 		db.log.Debugf("Could not defer constraints (this is okay if none are deferrable): %v", err)
 	}
 
 	for _, stmt := range stmts {
-		if _, err := tx.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			// We can safely ignore "duplicate key value violates unique constraint" errors.
 			if strings.Contains(err.Error(), "duplicate key") {
 				db.log.Warnf("duplicate key: %s", err)
-				// Rollback and start a new transaction since the current one is aborted
+				// Rollback and start a new transaction; session settings persist on the connection.
 				tx.Rollback()
-				tx, err = db.conn.Begin()
+				tx, err = conn.BeginTx(ctx, nil)
 				if err != nil {
 					return fmt.Errorf("failed to begin transaction: %v", err)
 				}
 				continue
 			} else if strings.Contains(err.Error(), "is of type bytes but expression is of type text") {
-				// TODO(wbh1): This is absolutely horrible and I am ashamed of this code. Should figure out column types ahead of time.
 				db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", err.Error())
-				// Rollback and start a new transaction since the current one is aborted
 				tx.Rollback()
-				tx, err = db.conn.Begin()
+				tx, err = conn.BeginTx(ctx, nil)
 				if err != nil {
 					return fmt.Errorf("failed to begin transaction: %v", err)
 				}
 				stmt = strings.Replace(
 					strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
 					"'utf-8'", "'hex'", 1)
-				if _, err := tx.Exec(stmt); err != nil {
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
 					tx.Rollback()
 					return fmt.Errorf("%v %v", err.Error(), stmt)
 				}
@@ -163,91 +252,126 @@ func (db *DB) importBatch(stmts []string) error {
 	return nil
 }
 
+const maxFixupConcurrency = 4
+
 // Change column types that expect boolean to integer so that we can get the data in.
 // We'll decode their values into booleans later.
 func (db *DB) prepareTables() (errorEncountered bool) {
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		sem    = make(chan struct{}, maxFixupConcurrency)
+		errOut bool
+	)
+
 	for _, table := range TableChanges {
-		// for each column associated with the table,
-		// update the column type to be integer so that it's compatible with sqlite's 0/1 bool values
-		for _, column := range table.Columns {
-			// If the column has a default value associated with it, drop it.
-			if column.Default != "" {
-				stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", table.Table, column.Name)
+		table := table
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			for _, column := range table.Columns {
+				if column.Default != "" {
+					stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT", table.Table, column.Name)
+					db.log.Debugln("Executing: ", stmt)
+					if _, err := db.conn.Exec(stmt); err != nil {
+						if strings.Contains(err.Error(), "does not exist") {
+							db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
+						} else {
+							db.log.Warnf("%v %v", err.Error(), stmt)
+							mu.Lock()
+							errOut = true
+							mu.Unlock()
+						}
+					}
+				}
+
+				stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE integer USING %s::integer", table.Table, column.Name, column.Name)
 				db.log.Debugln("Executing: ", stmt)
 				if _, err := db.conn.Exec(stmt); err != nil {
 					if strings.Contains(err.Error(), "does not exist") {
 						db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
 					} else {
 						db.log.Warnf("%v %v", err.Error(), stmt)
-						errorEncountered = true
+						mu.Lock()
+						errOut = true
+						mu.Unlock()
 					}
 				}
 			}
-
-			stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE integer USING %s::integer", table.Table, column.Name, column.Name)
-			db.log.Debugln("Executing: ", stmt)
-			if _, err := db.conn.Exec(stmt); err != nil {
-				if strings.Contains(err.Error(), "does not exist") {
-					db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
-				} else {
-					db.log.Warnf("%v %v", err.Error(), stmt)
-					errorEncountered = true
-				}
-			}
-
-		}
+		}()
 	}
 
+	wg.Wait()
+
 	// Delete the org that gets auto-generated the first time Grafana runs.
+	// Must run after all ALTERs complete.
 	stmt := "DELETE FROM org WHERE id=1"
 	db.log.Debugln("Executing: ", stmt)
 	if _, err := db.conn.Exec(stmt); err != nil {
 		db.log.Errorf("%v %v", err.Error(), stmt)
-		errorEncountered = true
+		errOut = true
 	}
 
-	return
+	return errOut
 }
 
-// Change columns back to boolean type by decoding their current values
+// Change columns back to boolean type by decoding their current values.
 func (db *DB) decodeBooleanColumns() bool {
-
-	var errorEncountered bool
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		sem    = make(chan struct{}, maxFixupConcurrency)
+		errOut bool
+	)
 
 	for _, table := range TableChanges {
-		for _, column := range table.Columns {
-			stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE boolean USING CASE WHEN %s = 0 THEN FALSE WHEN %s = 1 THEN TRUE ELSE NULL END", table.Table, column.Name, column.Name, column.Name)
-			db.log.Debugln("Executing: ", stmt)
-			if _, err := db.conn.Exec(stmt); err != nil {
-				if strings.Contains(err.Error(), "does not exist") {
-					db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
-				} else {
-					db.log.Warnf("%v %v", err.Error(), stmt)
-					errorEncountered = true
-				}
-			}
+		table := table
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-			// If the column has a default value associated with it, drop it.
-			if column.Default != "" {
-				stmt = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s", table.Table, column.Name, column.Default)
+			for _, column := range table.Columns {
+				stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE boolean USING CASE WHEN %s = 0 THEN FALSE WHEN %s = 1 THEN TRUE ELSE NULL END", table.Table, column.Name, column.Name, column.Name)
 				db.log.Debugln("Executing: ", stmt)
 				if _, err := db.conn.Exec(stmt); err != nil {
 					if strings.Contains(err.Error(), "does not exist") {
 						db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
 					} else {
 						db.log.Warnf("%v %v", err.Error(), stmt)
-						errorEncountered = true
+						mu.Lock()
+						errOut = true
+						mu.Unlock()
+					}
+				}
+
+				if column.Default != "" {
+					stmt = fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s", table.Table, column.Name, column.Default)
+					db.log.Debugln("Executing: ", stmt)
+					if _, err := db.conn.Exec(stmt); err != nil {
+						if strings.Contains(err.Error(), "does not exist") {
+							db.log.Debugf("%s %v %v", "Column/table doesn't exist. This is usually fine to ignore, but here's the info:", err.Error(), stmt)
+						} else {
+							db.log.Warnf("%v %v", err.Error(), stmt)
+							mu.Lock()
+							errOut = true
+							mu.Unlock()
+						}
 					}
 				}
 			}
+		}()
+	}
 
-		} // end column loop
-	} // end table loop
-
-	return errorEncountered
+	wg.Wait()
+	return errOut
 }
 
-// Make sure that sequences are fine on the tables
+// Make sure that sequences are fine on the tables.
 func (db *DB) fixSequences() error {
 
 	// Query from https://wiki.postgresql.org/wiki/Fixing_Sequences
@@ -282,12 +406,11 @@ ORDER BY S.relname;`
 			return fmt.Errorf("%v %v", "Failed to retrieve sequence reset statement", err)
 		}
 
-		// Execute the generate statement
+		// Execute the generated statement
 		if _, err := db.conn.Exec(stmt); err != nil {
 			return fmt.Errorf("%v %v", err.Error(), stmt)
 		}
 	}
 
 	return nil
-
 }

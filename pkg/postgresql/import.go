@@ -31,8 +31,10 @@ func New(connString string, logger *logrus.Logger) (db DB, err error) {
 	return
 }
 
-// ImportDump imports a SQL dump file.
-func (db *DB) ImportDump(dumpFile string) error {
+// ImportDump imports a SQL dump file. If batchSize is 0, all statements are
+// executed in a single transaction. Otherwise statements are split into
+// transactions of at most batchSize statements each.
+func (db *DB) ImportDump(dumpFile string, batchSize int) error {
 
 	promptToContinue := func() bool {
 		reader := bufio.NewReader(os.Stdin)
@@ -63,6 +65,52 @@ func (db *DB) ImportDump(dumpFile string) error {
 
 	sqlStmts := strings.Split(string(file), ";\n")
 
+	// Filter out empty statements
+	stmts := make([]string, 0, len(sqlStmts))
+	for _, stmt := range sqlStmts {
+		stmt = strings.TrimSpace(stmt)
+		if stmt != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+
+	if batchSize <= 0 {
+		batchSize = len(stmts)
+	}
+
+	for i := 0; i < len(stmts); i += batchSize {
+		end := i + batchSize
+		if end > len(stmts) {
+			end = len(stmts)
+		}
+		batch := stmts[i:end]
+
+		batchNum := (i / batchSize) + 1
+		db.log.Infof("Importing batch %d (%d statements)", batchNum, len(batch))
+
+		if err := db.importBatch(batch); err != nil {
+			return fmt.Errorf("batch %d failed: %v", batchNum, err)
+		}
+	}
+
+	// Fix boolean columns that we converted before.
+	if errorEncountered := db.decodeBooleanColumns(); errorEncountered == true {
+		if promptToContinue() != true {
+			return fmt.Errorf("%s", "Stopping migration at user's request.")
+		}
+	}
+
+	// Fix sequences for new items.
+	if err := db.fixSequences(); err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
+// importBatch executes a slice of SQL statements inside a single transaction.
+func (db *DB) importBatch(stmts []string) error {
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
@@ -73,11 +121,7 @@ func (db *DB) ImportDump(dumpFile string) error {
 		db.log.Debugf("Could not defer constraints (this is okay if none are deferrable): %v", err)
 	}
 
-	for _, stmt := range sqlStmts {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
+	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			// We can safely ignore "duplicate key value violates unique constraint" errors.
 			if strings.Contains(err.Error(), "duplicate key") {
@@ -116,20 +160,7 @@ func (db *DB) ImportDump(dumpFile string) error {
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	// Fix boolean columns that we converted before.
-	if errorEncountered := db.decodeBooleanColumns(); errorEncountered == true {
-		if promptToContinue() != true {
-			return fmt.Errorf("%s", "Stopping migration at user's request.")
-		}
-	}
-
-	// Fix sequences for new items.
-	if err := db.fixSequences(); err != nil {
-		return err
-	}
-
 	return nil
-
 }
 
 // Change column types that expect boolean to integer so that we can get the data in.

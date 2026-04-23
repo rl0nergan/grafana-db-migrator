@@ -25,6 +25,7 @@ var (
 	// fix relationshop between dashboard and folders (provisioning error)
 	fixFoldersID = app.Flag("fix-folders-id", "Fix correlation between folders and dashboards").Bool()
 	pprofFile    = app.Flag("pprof", "Write CPU profile to the given file path").String()
+	batchSize    = app.Flag("batch-size", "Number of SQL statements per transaction batch (0 for single transaction)").Default("0").Int()
 )
 
 func main() {
@@ -158,7 +159,7 @@ func main() {
 	}
 
 	// Import the now-sanitized dump file into Postgres
-	if err := db.ImportDump(dumpPath); err != nil {
+	if err := db.ImportDump(dumpPath, *batchSize); err != nil {
 		log.Fatalf("❌ %v - failed to import dump file to Postgres.", err)
 	}
 	log.Infoln("✅ Imported dump file to Postgres")

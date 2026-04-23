@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"os/signal"
 	"runtime/pprof"
+	"syscall"
 
 	"github.com/percona/grafana-db-migrator/pkg/postgresql"
 	"github.com/percona/grafana-db-migrator/pkg/sqlite"
@@ -47,6 +49,17 @@ func main() {
 			log.Fatalf("❌ could not start CPU profile: %v", err)
 		}
 		defer pprof.StopCPUProfile()
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			log.Infof("Interrupted, flushing CPU profile to %s", *pprofFile)
+			pprof.StopCPUProfile()
+			f.Close()
+			os.Exit(1)
+		}()
+
 		log.Infof("CPU profiling enabled, writing to %s", *pprofFile)
 	}
 

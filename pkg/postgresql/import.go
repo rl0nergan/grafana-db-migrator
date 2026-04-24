@@ -4,14 +4,15 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
-	// Postgres driver
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 )
 
@@ -108,7 +109,7 @@ func (db *DB) ImportDump(dumpFile string, batchSize int) error {
 }
 
 // advanceQuoteState processes s tracking single-quoted SQL string state
-// ('' is an escaped quote inside a string). Returns whether the line ends a
+// (” is an escaped quote inside a string). Returns whether the line ends a
 // SQL statement and the updated in-string state.
 func advanceQuoteState(s string, inString bool) (endsStatement bool, newInString bool) {
 	for i := 0; i < len(s); i++ {
@@ -200,7 +201,10 @@ func streamStatements(r io.Reader, batchSize int, fn func([]string) error) error
 }
 
 // importBatchOnConn executes a slice of SQL statements inside a single
-// transaction on the provided dedicated connection.
+// transaction on the provided dedicated connection. Consecutive INSERT
+// statements targeting the same table are grouped and imported via
+// PostgreSQL COPY for better performance. If COPY fails for a group,
+// the function falls back to individual INSERT execution.
 func (db *DB) importBatchOnConn(ctx context.Context, conn *sql.Conn, stmts []string) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -212,37 +216,105 @@ func (db *DB) importBatchOnConn(ctx context.Context, conn *sql.Conn, stmts []str
 		db.log.Debugf("Could not defer constraints (this is okay if none are deferrable): %v", err)
 	}
 
+	var group *insertGroup
+
+	flushGroup := func() error {
+		if group == nil {
+			return nil
+		}
+		g := group
+		group = nil
+
+		// Try COPY within a savepoint so a failure doesn't abort the tx.
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT copy_sp"); err != nil {
+			return fmt.Errorf("failed to create savepoint: %v", err)
+		}
+
+		if copyErr := db.copyRowsTx(ctx, tx, g.table, g.columns, g.rows); copyErr == nil {
+			if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT copy_sp"); err != nil {
+				return fmt.Errorf("failed to release savepoint: %v", err)
+			}
+			db.log.Debugf("COPY %d rows into %s", len(g.rows), g.table)
+			return nil
+		} else {
+			db.log.Debugf("COPY into %s failed (%v), falling back to INSERT", g.table, copyErr)
+		}
+
+		if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT copy_sp"); err != nil {
+			return fmt.Errorf("failed to rollback savepoint: %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT copy_sp"); err != nil {
+			return fmt.Errorf("failed to release savepoint: %v", err)
+		}
+
+		// Fallback: execute each INSERT individually with savepoints.
+		for _, row := range g.rows {
+			if err := db.execSingleInsert(ctx, tx, row.raw); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		return nil
+	}
+
 	for _, stmt := range stmts {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			// We can safely ignore "duplicate key value violates unique constraint" errors.
-			if strings.Contains(err.Error(), "duplicate key") {
-				db.log.Warnf("duplicate key: %s", err)
-				// Rollback and start a new transaction; session settings persist on the connection.
-				tx.Rollback()
-				tx, err = conn.BeginTx(ctx, nil)
-				if err != nil {
-					return fmt.Errorf("failed to begin transaction: %v", err)
-				}
-				continue
-			} else if strings.Contains(err.Error(), "is of type bytes but expression is of type text") {
-				db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", err.Error())
-				tx.Rollback()
-				tx, err = conn.BeginTx(ctx, nil)
-				if err != nil {
-					return fmt.Errorf("failed to begin transaction: %v", err)
-				}
-				stmt = strings.Replace(
-					strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
-					"'utf-8'", "'hex'", 1)
-				if _, err := tx.ExecContext(ctx, stmt); err != nil {
-					tx.Rollback()
-					return fmt.Errorf("%v %v", err.Error(), stmt)
-				}
-			} else {
+		table, columns, valuesStr, isInsert := parseInsert(stmt)
+		if !isInsert {
+			if err := flushGroup(); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				tx.Rollback()
 				return fmt.Errorf("%v %v", err.Error(), stmt)
 			}
+			continue
 		}
+
+		tokens, tokErr := tokenizeValues(valuesStr)
+		var goValues []interface{}
+		parsedOK := tokErr == nil
+		if parsedOK {
+			goValues = make([]interface{}, len(tokens))
+			for i, tok := range tokens {
+				v, ok := sqlValueToGo(tok)
+				if !ok {
+					parsedOK = false
+					break
+				}
+				goValues[i] = v
+			}
+		}
+
+		if !parsedOK {
+			// Can't parse for COPY — flush group and exec as regular INSERT.
+			if err := flushGroup(); err != nil {
+				return err
+			}
+			if err := db.execSingleInsert(ctx, tx, stmt); err != nil {
+				tx.Rollback()
+				return err
+			}
+			continue
+		}
+
+		// Extend the current group or start a new one.
+		if group != nil && group.table == table && columnsMatch(group.columns, columns) {
+			group.rows = append(group.rows, pendingRow{values: goValues, raw: stmt})
+			continue
+		}
+
+		if err := flushGroup(); err != nil {
+			return err
+		}
+		group = &insertGroup{
+			table:   table,
+			columns: columns,
+			rows:    []pendingRow{{values: goValues, raw: stmt}},
+		}
+	}
+
+	if err := flushGroup(); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -250,6 +322,310 @@ func (db *DB) importBatchOnConn(ctx context.Context, conn *sql.Conn, stmts []str
 	}
 
 	return nil
+}
+
+// --- COPY helpers ---
+
+type pendingRow struct {
+	values []interface{}
+	raw    string // original INSERT statement for fallback
+}
+
+type insertGroup struct {
+	table   string
+	columns []string
+	rows    []pendingRow
+}
+
+func columnsMatch(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// copyRowsTx bulk-inserts rows into table using the PostgreSQL COPY protocol.
+func (db *DB) copyRowsTx(ctx context.Context, tx *sql.Tx, table string, columns []string, rows []pendingRow) error {
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn(table, columns...))
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if _, err := stmt.ExecContext(ctx, row.values...); err != nil {
+			stmt.Close()
+			return err
+		}
+	}
+	if _, err := stmt.ExecContext(ctx); err != nil { // flush
+		stmt.Close()
+		return err
+	}
+	return stmt.Close()
+}
+
+// execSingleInsert executes a single INSERT statement within a savepoint,
+// handling duplicate-key and type-mismatch errors gracefully.
+func (db *DB) execSingleInsert(ctx context.Context, tx *sql.Tx, stmt string) error {
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT row_sp"); err != nil {
+		return fmt.Errorf("failed to create savepoint: %v", err)
+	}
+
+	if _, execErr := tx.ExecContext(ctx, stmt); execErr != nil {
+		tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT row_sp")
+
+		if strings.Contains(execErr.Error(), "duplicate key") {
+			db.log.Warnf("duplicate key: %s", execErr)
+			tx.ExecContext(ctx, "RELEASE SAVEPOINT row_sp")
+			return nil
+		}
+
+		if strings.Contains(execErr.Error(), "is of type bytes but expression is of type text") {
+			db.log.Debugf("Failed to import because of type issue (%v). Trying to fix...\n", execErr.Error())
+			fixed := strings.Replace(
+				strings.Replace(stmt, `,convert_from('\x`, ",decode('", 1),
+				"'utf-8'", "'hex'", 1)
+			if _, fixErr := tx.ExecContext(ctx, fixed); fixErr != nil {
+				tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT row_sp")
+				tx.ExecContext(ctx, "RELEASE SAVEPOINT row_sp")
+				return fmt.Errorf("%v %v", fixErr.Error(), fixed)
+			}
+			tx.ExecContext(ctx, "RELEASE SAVEPOINT row_sp")
+			return nil
+		}
+
+		tx.ExecContext(ctx, "RELEASE SAVEPOINT row_sp")
+		return fmt.Errorf("%v %v", execErr.Error(), stmt)
+	}
+
+	tx.ExecContext(ctx, "RELEASE SAVEPOINT row_sp")
+	return nil
+}
+
+// --- INSERT statement parsing ---
+
+// parseInsert extracts the table name, column names, and VALUES portion from
+// a sanitized INSERT statement (no trailing semicolon).
+// Expected format: INSERT INTO "table" ("col1", "col2") VALUES(...)
+func parseInsert(stmt string) (table string, columns []string, valuesStr string, ok bool) {
+	const prefix = `INSERT INTO "`
+	if !strings.HasPrefix(stmt, prefix) {
+		return
+	}
+	rest := stmt[len(prefix):]
+	idx := strings.IndexByte(rest, '"')
+	if idx < 0 {
+		return
+	}
+	table = rest[:idx]
+	rest = strings.TrimLeft(rest[idx+1:], " ")
+
+	// Expect (columns)
+	if len(rest) == 0 || rest[0] != '(' {
+		return
+	}
+	closeParen := -1
+	inDQ := false
+	for i := 1; i < len(rest); i++ {
+		if rest[i] == '"' {
+			inDQ = !inDQ
+		} else if rest[i] == ')' && !inDQ {
+			closeParen = i
+			break
+		}
+	}
+	if closeParen < 0 {
+		return
+	}
+	colStr := rest[1:closeParen]
+	rest = strings.TrimLeft(rest[closeParen+1:], " ")
+
+	for _, c := range strings.Split(colStr, ",") {
+		c = strings.TrimSpace(c)
+		c = strings.Trim(c, `"`)
+		if c != "" {
+			columns = append(columns, c)
+		}
+	}
+
+	if !strings.HasPrefix(rest, "VALUES") {
+		return
+	}
+	valuesStr = strings.TrimLeft(rest[6:], " ")
+	ok = true
+	return
+}
+
+// tokenizeValues splits a "(v1,v2,...)" VALUES list into individual value
+// tokens. Handles single-quoted strings with ” escapes and nested
+// parentheses (e.g. chr(10)).
+func tokenizeValues(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return nil, fmt.Errorf("values not parenthesized: %.40s", s)
+	}
+	inner := s[1 : len(s)-1]
+
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	depth := 0
+
+	for i := 0; i < len(inner); i++ {
+		ch := inner[i]
+		if inQuote {
+			cur.WriteByte(ch)
+			if ch == '\'' {
+				if i+1 < len(inner) && inner[i+1] == '\'' {
+					cur.WriteByte('\'')
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+		} else {
+			switch ch {
+			case '\'':
+				inQuote = true
+				cur.WriteByte(ch)
+			case '(':
+				depth++
+				cur.WriteByte(ch)
+			case ')':
+				depth--
+				cur.WriteByte(ch)
+			case ',':
+				if depth == 0 {
+					tokens = append(tokens, strings.TrimSpace(cur.String()))
+					cur.Reset()
+				} else {
+					cur.WriteByte(ch)
+				}
+			default:
+				cur.WriteByte(ch)
+			}
+		}
+	}
+
+	last := strings.TrimSpace(cur.String())
+	if last != "" || len(tokens) > 0 {
+		tokens = append(tokens, last)
+	}
+	return tokens, nil
+}
+
+// sqlValueToGo converts a SQL literal token to a Go value for pq.CopyIn.
+// Returns (value, true) on success or (nil, false) if the token can't be evaluated.
+func sqlValueToGo(token string) (interface{}, bool) {
+	if strings.ToUpper(token) == "NULL" {
+		return nil, true
+	}
+
+	// Single-quoted string literal
+	if len(token) >= 2 && token[0] == '\'' && token[len(token)-1] == '\'' {
+		inner := token[1 : len(token)-1]
+		// Hex-encoded bytea: '\xABCD'
+		if strings.HasPrefix(inner, `\x`) || strings.HasPrefix(inner, `\X`) {
+			b, err := hex.DecodeString(inner[2:])
+			if err != nil {
+				return nil, false
+			}
+			return b, true
+		}
+		return strings.ReplaceAll(inner, "''", "'"), true
+	}
+
+	// String concatenation: 'a'||chr(10)||'b'
+	if strings.Contains(token, "||") {
+		val, err := evalConcat(token)
+		if err != nil {
+			return nil, false
+		}
+		return val, true
+	}
+
+	// Standalone chr(N)
+	lower := strings.ToLower(token)
+	if strings.HasPrefix(lower, "chr(") && strings.HasSuffix(token, ")") {
+		val, err := evalChr(token)
+		if err != nil {
+			return nil, false
+		}
+		return val, true
+	}
+
+	// Numeric or other literal — pass as string; Postgres casts during COPY.
+	return token, true
+}
+
+// evalChr evaluates "chr(N)" to its UTF-8 character string.
+func evalChr(s string) (string, error) {
+	inner := s[4 : len(s)-1]
+	n, err := strconv.Atoi(strings.TrimSpace(inner))
+	if err != nil {
+		return "", err
+	}
+	return string(rune(n)), nil
+}
+
+// evalConcat evaluates a SQL || concatenation expression containing string
+// literals and chr(N) calls.
+func evalConcat(s string) (string, error) {
+	parts := splitConcat(s)
+	var b strings.Builder
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if len(p) >= 2 && p[0] == '\'' && p[len(p)-1] == '\'' {
+			inner := p[1 : len(p)-1]
+			b.WriteString(strings.ReplaceAll(inner, "''", "'"))
+		} else if strings.HasPrefix(strings.ToLower(p), "chr(") && strings.HasSuffix(p, ")") {
+			ch, err := evalChr(p)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(ch)
+		} else {
+			return "", fmt.Errorf("unsupported concat operand: %s", p)
+		}
+	}
+	return b.String(), nil
+}
+
+// splitConcat splits a SQL expression on || while respecting single-quoted strings.
+func splitConcat(s string) []string {
+	var parts []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		if inQuote {
+			cur.WriteByte(s[i])
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					cur.WriteByte('\'')
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+		} else if s[i] == '\'' {
+			inQuote = true
+			cur.WriteByte(s[i])
+		} else if i+1 < len(s) && s[i] == '|' && s[i+1] == '|' {
+			parts = append(parts, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			i++ // skip second |
+		} else {
+			cur.WriteByte(s[i])
+		}
+	}
+	if cur.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(cur.String()))
+	}
+	return parts
 }
 
 const maxFixupConcurrency = 4
